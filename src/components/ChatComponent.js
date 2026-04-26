@@ -25,7 +25,74 @@ function ChatComponent() {
     const userMsg = { role: 'user', text: query };
     setMessages(prev => [...prev, userMsg, { role: 'assistant', text: "" }]);
 
-    try {
+//     try {
+//       const response = await fetch('/api/ask', {
+//         method: 'POST',
+//         headers: { 'Content-Type': 'application/json' },
+//         body: JSON.stringify({ query })
+//       });
+
+//       const reader = response.body.getReader();
+//       const decoder = new TextDecoder();
+//       let aiText = "";
+
+//       while (true) {
+//         const { done, value } = await reader.read();
+//         if (done) break;
+
+//         const chunk = decoder.decode(value);
+//         const lines = chunk.split('\n');
+
+//         // for (const line of lines) {
+//         //   if (line.startsWith('data: ') && !line.includes('[DONE]')) {
+//         //     try {
+//         //       const data = JSON.parse(line.substring(6));
+//         //       aiText += data.text;
+              
+//         //       setMessages(prev => {
+//         //         const updated = [...prev];
+//         //         updated[updated.length - 1] = { 
+//         //           role: 'assistant', 
+//         //           text: aiText 
+//         //         };
+//         //         return updated;
+//         //       });
+//         //     } catch (e) {
+//         //       console.error("Stream parse error:", e);
+//         //     }
+//         //   }
+//         // }
+//         for (const line of lines) {
+//   if (line.startsWith('data: ') && !line.includes('[DONE]')) {
+//     try {
+//       const data = JSON.parse(line.substring(6));
+//       aiText += data.text;
+      
+//       // Capture the current value in a local constant 
+//       // to ensure the closure uses the correct version
+//       const currentAiText = aiText; 
+
+//       setMessages(prev => {
+//         const updated = [...prev];
+//         updated[updated.length - 1] = { 
+//           role: 'assistant', 
+//           text: currentAiText 
+//         };
+//         return updated;
+//       });
+//     } catch (e) {
+//       console.error("Stream parse error:", e);
+//     }
+//   }
+// }
+//       }
+//     } catch (error) {
+//       console.error("Streaming error:", error);
+//     } finally {
+//       setIsTyping(false);
+//       setQuery("");
+//     }
+try {
       const response = await fetch('/api/ask', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -34,26 +101,28 @@ function ChatComponent() {
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
-      let aiText = "";
+      let accumulatedText = ""; // Renamed to avoid confusion
 
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
 
         const chunk = decoder.decode(value);
-        const lines = chunk.split('\n');
+        const lines = chunk.split('\n'); // 'lines' is used here
 
         for (const line of lines) {
           if (line.startsWith('data: ') && !line.includes('[DONE]')) {
             try {
               const data = JSON.parse(line.substring(6));
-              aiText += data.text;
+              accumulatedText += data.text; // 'accumulatedText' is used here
               
+              const currentBatch = accumulatedText; 
+
               setMessages(prev => {
                 const updated = [...prev];
                 updated[updated.length - 1] = { 
                   role: 'assistant', 
-                  text: aiText 
+                  text: currentBatch 
                 };
                 return updated;
               });
@@ -65,9 +134,6 @@ function ChatComponent() {
       }
     } catch (error) {
       console.error("Streaming error:", error);
-    } finally {
-      setIsTyping(false);
-      setQuery("");
     }
   };
 
