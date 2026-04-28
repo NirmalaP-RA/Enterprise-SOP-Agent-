@@ -1,148 +1,185 @@
 const dns = require('node:dns');
 dns.setServers(['8.8.8.8', '8.8.4.4']);
 require('dotenv').config();
+
 const express = require('express');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const { MongoClient } = require('mongodb');
-const { MongoDBAtlasVectorSearch } = require("@langchain/mongodb");
-const { GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI } = require("@langchain/google-genai");
-const { PDFLoader } = require("@langchain/community/document_loaders/fs/pdf");
+
+// LangChain & Google AI Imports
+const { ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings } = require("@langchain/google-genai");
 const { RecursiveCharacterTextSplitter } = require("@langchain/textsplitters");
+const { MongoDBAtlasVectorSearch } = require("@langchain/mongodb");
+const { PDFLoader } = require("@langchain/community/document_loaders/fs/pdf");
 
 const app = express();
 app.use(express.json());
 
-// Configure Multer for PDF storage [cite: 62]
+// Configure Multer for PDF storage
 const upload = multer({ dest: 'uploads/' });
 
-// Database Configuration [cite: 17, 36]
-const client = new MongoClient(process.env.MONGODB_ATLAS_URI,{
- tls: true,
-  tlsAllowInvalidCertificates: true, // Overrides the SSL Alert 80
-  connectTimeoutMS: 5000,
-  family: 4 // Forces IPv4
-  
+// Database Configuration
+const client = new MongoClient(process.env.MONGODB_ATLAS_URI, {
+    tls: true,
+    tlsAllowInvalidCertificates: true,
+    connectTimeoutMS: 5000,
+    family: 4 
 });
+
 const dbName = process.env.DB_NAME || "OpsMindAI";
 const collectionName = process.env.COLLECTION_NAME || "sop-agent";
 
-// AI Engine Setup: Gemini 1.5 Flash [cite: 21, 33]
+// AI Engine Setup
 const embeddings = new GoogleGenerativeAIEmbeddings({
-  apiKey: process.env.GOOGLE_GENAI_API_KEY,
-  model: "embedding-001",
+    apiKey: process.env.GOOGLE_GENAI_API_KEY,
+    model: "gemini-embedding-001", // Fixed: Use 'model' key for stability
 });
 
 const model = new ChatGoogleGenerativeAI({
-  apiKey: process.env.GOOGLE_GENAI_API_KEY,
-  model: "gemini-1.5-flash",
-  streaming: true,
+    apiKey: process.env.GOOGLE_GENAI_API_KEY,
+    modelName: "gemini-2.5-flash", // Use the 1.5 stable name
+    // apiVersion: "v1beta",           // Back to v1beta for better model compatibility
+    maxOutputTokens: 2048,
+    streaming: true,
 });
 
 /**
- * WEEK 1: Knowledge Ingestion
- * Parses PDF, chunks text (1000 chars/100 overlap), and stores in Atlas [cite: 62]
+ * UPLOAD ROUTE: /api/uploads
+ * Processes PDF -> Chunks -> Embeddings -> MongoDB Atlas
  */
-app.post('/api/ingest', upload.single('file'), async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+app.post('/api/uploads', upload.single('file'), async (req, res) => {
+    try {
+        if (!req.file) return res.status(400).json({ error: "No file uploaded" });
 
-    const loader = new PDFLoader(req.file.path);
-    const docs = await loader.load();
+        console.log(`--- Starting Upload: ${req.file.originalname} ---`);
 
-    // Mandatory chunking strategy [cite: 62]
-    const splitter = new RecursiveCharacterTextSplitter({
-      chunkSize: 1000,
-      chunkOverlap: 100,
-    });
+        // 1. Load and Split PDF
+        const loader = new PDFLoader(req.file.path);
+        const docs = await loader.load();
+        const splitter = new RecursiveCharacterTextSplitter({
+            chunkSize: 1000,
+            chunkOverlap: 100,
+        });
+        const chunks = await splitter.splitDocuments(docs);
 
-    const splitDocs = await splitter.splitDocuments(docs);
-    const collection = client.db(dbName).collection(collectionName);
+        // 2. Manual Embedding Generation (The Fix)
+        console.log(`Generating embeddings for ${chunks.length} chunks...`);
+        
+        const docsWithEmbeddings = [];
+        
+        for (const chunk of chunks) {
+            // We call the embedding API directly for each chunk to verify data
+            const vector = await embeddings.embedQuery(chunk.pageContent);
+            
+            if (!vector || vector.length === 0) {
+                throw new Error("CRITICAL: Google returned an empty array. Check API Key/Model.");
+            }
+            
+            docsWithEmbeddings.push({
+                text: chunk.pageContent,
+                embedding: vector, // This ensures the 'embedding' field is populated with numbers
+                metadata: {
+                    ...chunk.metadata,
+                    source: req.file.originalname,
+                    createdAt: new Date()
+                }
+            });
+        }
 
-    // Store in MongoDB Atlas Vector Search [cite: 36, 62]
-    await MongoDBAtlasVectorSearch.fromDocuments(splitDocs, embeddings, {
-      collection,
-      indexName: "vector_index", 
-    });
+        // 3. Save to MongoDB
+        const collection = client.db(dbName).collection(collectionName);
+        
+        // Optional: Clear old data if you want a fresh start
+        // await collection.deleteMany({}); 
 
-    // Cleanup uploaded file
-    fs.unlinkSync(req.file.path);
+        await collection.insertMany(docsWithEmbeddings);
 
-    res.status(200).json({ message: "Knowledge base updated successfully." });
-  } catch (err) {
-    console.error("Ingestion Error:", err);
-    res.status(500).json({ error: err.message });
-  }
+        // Cleanup temp file
+        if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
+
+        console.log("--- Upload Success: Vectors stored in Atlas ---");
+        res.status(200).json({ message: "Success! 768-dimension vectors stored." });
+
+    } catch (error) {
+        console.error("UPLOAD ERROR DETAILS:", error.message);
+        res.status(500).json({ error: "Failed to process PDF", details: error.message });
+    }
 });
 
 /**
- * WEEK 3 & 4: Retrieval & Streaming Engine
- * Retrieves top 3-5 relevant chunks and streams response via SSE [cite: 40, 57]
+ * QUERY ROUTE: /api/ask
+ * Handles RAG retrieval and streaming response
  */
 app.post('/api/ask', async (req, res) => {
-  const { query } = req.body;
-  
-  // Set headers for Server-Sent Events (SSE) [cite: 40]
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
+    const { query } = req.body;
+    
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
 
-  try {
-    const collection = client.db(dbName).collection(collectionName);
-    const vectorStore = new MongoDBAtlasVectorSearch(embeddings, { collection, indexName: "vector_index" });
+    try {
+        const collection = client.db(dbName).collection(collectionName);
+        const vectorStore = new MongoDBAtlasVectorSearch(embeddings, { 
+            collection, 
+            indexName: "vector_index" 
+        });
 
-    // Retrieve top relevant chunks [cite: 57]
-    const retrievedDocs = await vectorStore.similaritySearch(query, 4);
+        // Similarity search
+        const retrievedDocs = await vectorStore.similaritySearch(query, 4);
 
-    // Format context with metadata for precise Source Citation 
-    const context = retrievedDocs.map(d => {
-      const sourceName = d.metadata.source || "SOP Document";
-      const pageNum = d.metadata.loc?.pageNumber || "Unknown";
-      return `[FILE: ${sourceName}, PAGE: ${pageNum}] CONTENT: ${d.pageContent}`;
-    }).join("\n\n");
+        const context = retrievedDocs.map(d => {
+            const sourceName = d.metadata.source || "SOP Document";
+            const pageNum = d.metadata.loc?.pageNumber || "Unknown";
+            return `[FILE: ${sourceName}, PAGE: ${pageNum}] CONTENT: ${d.pageContent}`;
+        }).join("\n\n");
 
-    // Strict System Prompt to prevent Hallucinations [cite: 55, 66]
-    const systemPrompt = `
-      You are OpsMind AI, a corporate knowledge agent. 
-      Use the provided SOP context to answer the user's question.
-      
-      RULES:
-      1. Use ONLY the provided context.
-      2. If the answer is not in the context, explicitly state: "I don't know." 
-      3. For every claim, cite the File and Page number from the context.
-      
-      CONTEXT:
-      ${context}
+        // const systemPrompt = `
+        //     You are OpsMind AI, a corporate knowledge agent. 
+        //     Use the provided SOP context to answer the user's question.
+        //     Only use the provided context. If unsure, say "I don't know."
+        //     CONTEXT:
+        //     ${context}
+        // `;
+        const combinedPrompt = `
+        INSTRUCTIONS: You are OpsMind AI, a corporate knowledge agent. 
+        Use the provided SOP context to answer the user's question.
+        Only use the provided context. If unsure, say "I don't know."
+
+        CONTEXT:
+        ${context}
+
+        USER QUESTION: 
+        ${query}
     `;
 
-    const stream = await model.stream([
-      ["system", systemPrompt],
-      ["human", query]
-    ]);
+        const stream = await model.stream([
+            // ["system", systemPrompt],
+            // ["human", query],
+            ["human", combinedPrompt]
+        ]);
 
-    // Stream tokens to frontend for the mandatory "Typing Effect" [cite: 41]
-    for await (const chunk of stream) {
-      res.write(`data: ${JSON.stringify({ text: chunk.content })}\n\n`);
+        for await (const chunk of stream) {
+            res.write(`data: ${JSON.stringify({ text: chunk.content })}\n\n`);
+        }
+
+        res.write('data: [DONE]\n\n');
+        res.end();
+    } catch (err) {
+        console.error("ASK ERROR:", err);
+        res.write(`data: ${JSON.stringify({ error: "Processing failed." })}\n\n`);
+        res.end();
     }
-
-    res.write('data: [DONE]\n\n');
-    res.end();
-  } catch (err) {
-    console.error("Stream Error:", err);
-    res.write(`data: ${JSON.stringify({ error: "Intelligence processing failed." })}\n\n`);
-    res.end();
-  }
 });
 
-// Start Orchestrator
+// Database connection and Server Start
 client.connect().then(() => {
-  const port = process.env.PORT || 5000;
-  app.listen(port, () => {
-    console.log(`Zaalima AI Orchestrator running on port ${port}`);
-    console.log(`Connected to MongoDB: ${dbName}`);
-  });
+    const port = process.env.PORT || 5001; // Matches your frontend fetch port
+    app.listen(port, () => {
+        console.log(`Server running on port ${port}`);
+        console.log(`Connected to MongoDB: ${dbName}`);
+    });
+}).catch(err => {
+    console.error("Failed to connect to MongoDB", err);
 });
-
-
-
